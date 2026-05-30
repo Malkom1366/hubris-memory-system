@@ -1,0 +1,67 @@
+{
+  "daemons": [
+    {
+      "name": "watcher",
+      "module": "daemon_watcher",
+      "description": "Polls session files for new messages and enqueues them for classification. Core daemon - disabling stops all automatic memory updates.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "classify",
+      "module": "daemon_classify",
+      "description": "Assigns new messages to subjects using the subagent model. Runs after watcher enqueues work.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "synthesize",
+      "module": "daemon_synthesize",
+      "description": "Compacts archived subjects into a single synthesized memory using the meta model.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "split",
+      "module": "daemon_split",
+      "description": "Detects large subjects that should be split into focused child subjects and proposes the split.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "compact",
+      "module": "daemon_compact",
+      "description": "Compacts active session message history when token count exceeds the configured ceiling.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "escalate",
+      "module": "daemon_escalate",
+      "description": "Escalates unclassified messages to the meta model when the subagent cannot assign them.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "reclass",
+      "module": "daemon_reclass",
+      "description": "After a subject split, re-attributes the parent's linked messages to the most appropriate child subject using the meta model.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "attenuate",
+      "module": "daemon_attenuate",
+      "description": "Decays confidence scores on semantic links over time so stale associations fade from recall.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    },
+    {
+      "name": "reconcile",
+      "module": "daemon_reconcile",
+      "description": "Detects agreement, contradiction, and supersession between memories sharing the same subject using vector similarity.",
+      "restart": "always",
+      "health_check_interval_s": 5
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy this to config.json and edit as needed. All fields have defaults.",
+
+  "endpoint": "http://localhost:11434",
+  "api_key": "",
+
+  "meta_model": "qwen3:30b-a3b",
+  "subagent_model": "qwen3:8b",
+  "embed_model": "nomic-embed-text",
+
+  "workspace_id": "global",
+
+  "sessions_dir": "",
+
+  "adapter": "continue",
+  "workspace_storage_dir": "",
+  "copilot_workspace_roots": [],
+
+  "poll_interval": 2,
+  "max_active_tokens": 8000,
+  "meta_agent_timeout": 120
+}

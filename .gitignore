@@ -1,0 +1,31 @@
+# Internal development docs - not for public repo
+CONCEPT.md
+DEV_LOG.md
+
+# Live config - use config.example.json as template
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Temp scripts
+tmp_*.py
+
+# OS
+.DS_Store
+Thumbs.db
