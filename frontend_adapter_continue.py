@@ -29,7 +29,7 @@ class ContinueAdapter:
     ADAPTER_NAME = "continue"
 
     def __init__(self, sessions_dir: str | Path | None = None) -> None:
-        if sessions_dir is None:
+        if not sessions_dir:
             self._dir = Path.home() / ".continue" / "sessions"
         else:
             self._dir = Path(sessions_dir)

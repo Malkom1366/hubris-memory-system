@@ -1,6 +1,7 @@
 # Internal development docs - not for public repo
 CONCEPT.md
 DEV_LOG.md
+ROADMAP.md
 
 # Live config - use config.example.json as template
 config.json

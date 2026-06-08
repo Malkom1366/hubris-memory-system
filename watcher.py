@@ -88,6 +88,10 @@ class SessionWatcher:
         """
         return self._adapters[0]
 
+    def get_adapters(self) -> list[SessionAdapter]:
+        """Return all active adapters managed by this watcher."""
+        return list(self._adapters)
+
     @property
     def _adapter(self) -> SessionAdapter:
         """Deprecated - use .adapter instead."""

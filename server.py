@@ -39,6 +39,7 @@ import supervisor as _supervisor
 import config as _config
 import db as _db
 from frontend_adapters import build_active_frontend_adapters
+import log as _log_module
 from log import get_logger
 
 # Import the FastMCP instance from tools. This import also executes tools.py,
@@ -47,6 +48,11 @@ import tools as _tools
 from tools import mcp  # noqa: F401 - re-exported for callers that do `from server import mcp`
 
 _log = get_logger("hubris.server")
+
+# Route FastMCP's own logger to hubris.log so tool-exception tracebacks appear
+# there instead of being silently discarded (the mcp.* loggers have no handlers
+# by default and do not propagate to root).
+_log_module.attach_external_logger("mcp")
 
 # ---------------------------------------------------------------------------
 # Backward-compatibility re-exports.
@@ -82,16 +88,15 @@ from tools import (  # noqa: F401
 # Startup argument parsing
 # ---------------------------------------------------------------------------
 
-def _parse_startup_args() -> tuple[str | None, str | None, bool]:
+def _parse_startup_args() -> bool:
     """
     Parse HuBrIS-specific CLI arguments from sys.argv.
 
-    Recognised flags (order-independent, case-insensitive):
-      --adapter:<name>   Override config.json 'adapter' key ('copilot' or 'continue').
-      --session:<id>     Bind this instance to one specific session ID.
-      --configure        Open the startup config dialog before launching daemons.
+    The only recognised flag is --configure, which forces the startup config
+    dialog open.  Adapter and session overrides are not accepted here - they
+    must be set through the config UI and saved before daemons launch.
 
-    Returns (adapter_override, explicit_session_id, configure).
+    Returns configure (bool).
     """
     return _config.parse_startup_args(sys.argv[1:])
 
@@ -104,32 +109,28 @@ def _parse_startup_args() -> tuple[str | None, str | None, bool]:
 if __name__ == "__main__":
     import config_ui as _config_ui
 
-    _config_existed = _config.CONFIG_PATH.exists()
-    _cfg = _config.load()
-
-    # Apply CLI overrides before constructing the watcher.
-    _argv_adapter, _argv_session_id, _configure = _parse_startup_args()
-
     # Start MCP immediately so VS Code gets its `initialize` response and stops
     # retrying. Tools are gated by _runtime is None until config is confirmed.
     import threading as _threading
     _mcp_thread = _threading.Thread(target=mcp.run, daemon=True, name="hubris-mcp")
     _mcp_thread.start()
 
-    # Show the startup config dialog on every run.
-    _ui_result = _config_ui.show(_cfg)
+    _configure = _parse_startup_args()
+
+    # Load the pre-existing config only to seed the UI with current values.
+    # The authoritative config used by all daemons is what the user saves here.
+    _cfg_seed = _config.load()
+
+    # Show the startup config dialog on every run. The user's saved choices are
+    # the exclusive source of truth for adapter, workspace_id, and all settings.
+    _ui_result = _config_ui.show(_cfg_seed)
     if _ui_result is False:
         sys.exit(0)
     elif _ui_result is not None:
         _config.save(_ui_result)
-        _cfg = _ui_result
 
-    if _argv_adapter:
-        _cfg["adapter"] = _argv_adapter
-        _log.info("STARTUP: adapter overridden via CLI -> '%s'", _argv_adapter)
-
-    if _argv_session_id:
-        _log.info("STARTUP: session bound via CLI -> %s", _argv_session_id[:8])
+    # Load config fresh from disk - this is exactly what the user just saved.
+    _cfg = _config.load()
 
     _root_init = _config.memory_root(_cfg.get("workspace_id", "global"))
     _db.init_db(_root_init)
@@ -137,7 +138,7 @@ if __name__ == "__main__":
     for _install_adapter in _active_adapters:
         _install_adapter.install_rules(_cfg)
 
-    if _supervisor.launch(watcher_args=sys.argv[1:]):
+    if _supervisor.launch():
         _log.info("SUPERVISOR: primary - daemons launched")
     else:
         _log.warning("SUPERVISOR: secondary - MCP tools only (daemons managed by another process)")
@@ -145,7 +146,6 @@ if __name__ == "__main__":
     # Populate the tools module with runtime state now that startup is complete.
     _tools._runtime = _tools._HubrisRuntime(
         adapter=_active_adapters[0] if _active_adapters else None,
-        bound_session=_argv_session_id,
     )
 
     _mcp_thread.join()

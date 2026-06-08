@@ -3,11 +3,13 @@
 Manages the lifecycle of background daemon subprocesses (daemon_watcher,
 daemon_classify, etc.) as defined in manifest.json.  Provides:
 
-  launch(watcher_args)  - start all daemons and kick off the health-check thread.
-  shutdown()            - terminate all running daemons.
+  launch()   - start all daemons and kick off the health-check thread.
+  shutdown() - terminate all running daemons.
 
-Called once by server.py at startup.  Acquires supervisor.lock to ensure only
-one supervisor manages the daemon cluster at a time.
+Called once by server.py at startup after the user has saved config through
+the startup UI.  All configuration is read from config.json.  Acquires
+supervisor.lock to ensure only one supervisor manages the daemon cluster
+at a time.
 """
 
 import atexit
@@ -19,6 +21,12 @@ import sys
 import threading
 from pathlib import Path
 
+try:
+    import psutil as _psutil
+    _HAVE_PSUTIL = True
+except ImportError:
+    _HAVE_PSUTIL = False
+
 import config as _config
 from daemons import discover_daemon_specs
 from log import get_logger
@@ -27,6 +35,10 @@ _log = get_logger("hubris.supervisor")
 
 # Directory for per-daemon graceful restart tokens.
 _RESTART_TOKENS_DIR = _config.HUBRIS_HOME / "restart_tokens"
+
+# JSON file recording PIDs of daemons launched by the current supervisor,
+# so a successor supervisor can kill orphans when stealing a dead lock.
+_DAEMON_PIDS_PATH = _config.HUBRIS_HOME / "daemon_pids.json"
 
 # name -> mtime (float) of the daemon's .py file at the time it was last started
 _daemon_mtimes: dict[str, float] = {}
@@ -41,13 +53,11 @@ _shutdown_event = threading.Event()
 # Daemon lifecycle
 # ---------------------------------------------------------------------------
 
-def _start_daemon(spec: dict, extra_args: list[str] | None = None) -> subprocess.Popen:
+def _start_daemon(spec: dict) -> subprocess.Popen:
     """Launch a daemon subprocess for the given manifest spec."""
     module = spec["module"]
     name = spec["name"]
     cmd = [sys.executable, "-m", module]
-    if extra_args:
-        cmd.extend(extra_args)
     proc = subprocess.Popen(
         cmd,
         cwd=Path(__file__).parent,
@@ -60,7 +70,48 @@ def _start_daemon(spec: dict, extra_args: list[str] | None = None) -> subprocess
     daemon_file = Path(__file__).parent / f"{module}.py"
     if daemon_file.exists():
         _daemon_mtimes[name] = daemon_file.stat().st_mtime
+    # Keep daemon_pids.json up to date so a successor supervisor can kill orphans.
+    _write_daemon_pids()
     return proc
+
+
+def _write_daemon_pids() -> None:
+    """Persist the PIDs of all currently tracked daemon processes."""
+    pids = {name: proc.pid for name, proc in _daemon_processes.items() if proc.poll() is None}
+    try:
+        _DAEMON_PIDS_PATH.write_text(json.dumps(pids))
+    except OSError:
+        pass
+
+
+def _kill_orphan_daemons() -> None:
+    """Kill any daemon PIDs recorded by a previous supervisor instance."""
+    if not _DAEMON_PIDS_PATH.exists():
+        return
+    try:
+        pids: dict = json.loads(_DAEMON_PIDS_PATH.read_text())
+    except Exception:
+        return
+    for name, pid in pids.items():
+        try:
+            if _HAVE_PSUTIL:
+                p = _psutil.Process(pid)
+                p.terminate()
+                try:
+                    p.wait(timeout=3)
+                except _psutil.TimeoutExpired:
+                    p.kill()
+            else:
+                os.kill(pid, 9)
+            _log.info("SUPERVISOR: killed orphan %s (PID=%d)", name, pid)
+        except (ProcessLookupError, OSError):
+            pass  # already gone
+        except Exception as exc:
+            _log.warning("SUPERVISOR: could not kill orphan %s (PID=%d): %s", name, pid, exc)
+    try:
+        _DAEMON_PIDS_PATH.unlink()
+    except OSError:
+        pass
 
 
 def _health_check_loop() -> None:
@@ -80,7 +131,7 @@ def _health_check_loop() -> None:
                     name, exit_code,
                 )
                 if spec.get("restart") == "always":
-                    new_proc = _start_daemon(spec)
+                    new_proc = _start_daemon(spec)  # _write_daemon_pids called inside
                     _daemon_processes[name] = new_proc
         # Write restart tokens for any running daemon whose module file has been
         # updated since it was last started.  The daemon's run() loop polls for
@@ -118,6 +169,11 @@ def shutdown() -> None:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+    # Remove the PID registry so a successor does not try to kill already-dead processes.
+    try:
+        _DAEMON_PIDS_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -128,13 +184,62 @@ _SUPERVISOR_LOCK_PATH = _config.HUBRIS_HOME / "supervisor.lock"
 _supervisor_lock_fh = None
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if the given PID is a running process."""
+    if _HAVE_PSUTIL:
+        return _psutil.pid_exists(pid)
+    # Windows: os.kill(pid, 0) is unreliable (WinError 11 on Python 3.14 for
+    # cross-architecture PIDs). Use OpenProcess with SYNCHRONIZE access instead.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            # ERROR_ACCESS_DENIED (5) means the process exists but we can't open it.
+            return ctypes.windll.kernel32.GetLastError() == 5
+        except Exception:
+            pass
+    # POSIX fallback.
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _acquire_lock() -> bool:
     """
     Acquire supervisor.lock exclusively.  Returns True if this process is
-    the primary supervisor, False if another process already holds the lock.
+    the primary supervisor, False if another live process already holds the lock.
+
+    If the lock file exists but the recorded PID is no longer alive, the lock
+    is considered stale.  We delete it, kill any orphan daemons recorded in
+    daemon_pids.json, and then acquire the lock for ourselves.
     """
     global _supervisor_lock_fh
     _config.HUBRIS_HOME.mkdir(parents=True, exist_ok=True)
+
+    # Check for a stale lock before trying to acquire.
+    if _SUPERVISOR_LOCK_PATH.exists():
+        try:
+            raw = _SUPERVISOR_LOCK_PATH.read_bytes().strip()
+            holder_pid = int(raw) if raw else 0
+        except Exception:
+            holder_pid = 0
+        if holder_pid and not _pid_is_alive(holder_pid):
+            _log.warning(
+                "SUPERVISOR: lock held by dead PID %d - stealing lock and killing orphans",
+                holder_pid,
+            )
+            _kill_orphan_daemons()
+            try:
+                _SUPERVISOR_LOCK_PATH.unlink()
+            except OSError:
+                pass
+
     try:
         _supervisor_lock_fh = open(_SUPERVISOR_LOCK_PATH, "a+b")
         msvcrt.locking(_supervisor_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
@@ -166,13 +271,13 @@ def _acquire_lock() -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def launch(watcher_args: list[str] | None = None) -> bool:
+def launch() -> bool:
     """
     Start all discovered daemons and kick off the health-check thread.
 
-    watcher_args: extra command-line arguments forwarded to daemon_watcher
-    (typically sys.argv[1:] from server.py, which may include --adapter and
-    --session flags).
+    All configuration (adapter, workspace_id, disabled daemons, etc.) is read
+    from config.json, which the user saved through the startup UI before this
+    is called.  No CLI arguments are forwarded to daemons.
 
     Returns True if this process acquired the supervisor lock and launched the
     daemons.  Returns False if another supervisor is already running; in that
@@ -204,8 +309,7 @@ def launch(watcher_args: list[str] | None = None) -> bool:
         except OSError:
             pass
     for spec in _daemon_specs:
-        extra = watcher_args if spec["name"] == "watcher" else None
-        proc = _start_daemon(spec, extra_args=extra)
+        proc = _start_daemon(spec)
         _daemon_processes[spec["name"]] = proc
 
     health_thread = threading.Thread(

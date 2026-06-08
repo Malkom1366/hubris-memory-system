@@ -117,3 +117,23 @@ def get_logger(name: str = "hubris") -> logging.Logger:
 
     _initialized.add(name)
     return logger
+
+
+def attach_external_logger(name: str, level: int = logging.WARNING) -> None:
+    """Route an external library's logger (e.g. 'mcp') to hubris.log.
+
+    Call this once at startup to capture FastMCP tool-exception tracebacks
+    that would otherwise be lost because the 'mcp.*' loggers have no handlers
+    and do not propagate to the root logger.
+
+    Safe to call multiple times - duplicate QueueHandlers are not added.
+    """
+    _ensure_listener()
+    logger = logging.getLogger(name)
+    for h in logger.handlers:
+        if isinstance(h, logging.handlers.QueueHandler) and h.queue is _log_queue:
+            return  # already attached
+    handler = logging.handlers.QueueHandler(_log_queue)
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False

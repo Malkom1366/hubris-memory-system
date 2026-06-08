@@ -145,10 +145,6 @@ _MEMORY_ACTION_HANDLERS: dict[str, Any] = {
 def main() -> None:
     cfg = _config.load()
 
-    for arg in sys.argv[1:]:
-        if arg.lower().startswith("--adapter:"):
-            cfg["adapter"] = arg.split(":", 1)[1].strip()
-
     root = _config.memory_root(cfg.get("workspace_id", "global"))
 
     global _adapter

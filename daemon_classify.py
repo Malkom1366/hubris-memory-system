@@ -17,7 +17,7 @@ Module-level state (loaded from DB at startup, mutated by handlers):
   _classify_failures  - {"session_id:offset": failure_count}
   _message_blacklist  - {session_id: {message_index: reason}} for blacklisted messages
 
-Run with: python -m daemon_classify [--adapter:<name>]
+Run with: python -m daemon_classify
 """
 
 import datetime

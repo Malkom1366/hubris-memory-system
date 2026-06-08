@@ -54,7 +54,6 @@ _log = get_logger("hubris.server")
 class _HubrisRuntime:
     """Container for daemon-layer state injected by server.py at startup."""
     adapter: Any                        # SessionAdapter instance (primary frontend adapter)
-    bound_session: str | None           # if set, only this session is processed
 
 _runtime: _HubrisRuntime | None = None
 
@@ -66,7 +65,10 @@ _STARTUP_PENDING = (
 
 def _assert_ready() -> str | None:
     """Return an error string if startup is not yet complete, else None."""
-    return _STARTUP_PENDING if _runtime is None else None
+    if _runtime is None:
+        _log.warning("TOOL: called before startup complete (_runtime is None) - returning STARTUP_PENDING")
+        return _STARTUP_PENDING
+    return None
 
 
 def _read_daemon_watcher_status() -> dict[str, Any]:
@@ -710,10 +712,11 @@ def get_status() -> str:
     bl_msg_ranges = len(_db.load_message_blacklist(root))
     pending_failures = len(_db.load_classify_failures(root))
 
-    # Estimate token usage for the calling session only.
-    # _runtime.bound_session is set at startup via the CLI --session:<id> flag.
+    # Estimate token usage for the most recently active whitelisted session.
     max_tokens = int(cfg.get("max_active_tokens", 8000))
-    active_sid = _runtime.bound_session
+    active_sid = status["in_flight"][0] if status.get("in_flight") else (
+        status["watching"][0] if status.get("watching") else None
+    )
 
     ctx_block: list[str]
     if active_sid and active_sid in status["watching"]:
@@ -743,8 +746,8 @@ def get_status() -> str:
         f"  In-flight cycles:   {len(status['in_flight'])}",
         f"  Poll interval:      {status['poll_interval']}s",
         "",
-        f"  Session binding:    {'explicit (' + _runtime.bound_session[:8] + ')' if _runtime.bound_session else 'whitelist'}",
-        f"  Adapter:            {cfg.get('adapter', 'continue')}",
+        f"  Session binding:    whitelist (config-driven)",
+        f"  Active adapters:    {', '.join(cfg.get('active_adapters', ['continue']))}",
         "",
         f"  Memory root:        {root}",
         f"  Subjects (open):    {open_count}",

@@ -105,11 +105,34 @@ DEFAULTS: dict[str, Any] = {
     "finalize_max_chars": 6000,
 }
 
+_WINDOWS_FILENAME_INVALID = frozenset('\\/:*?"<>|')
+
+
+def sanitize_workspace_id(workspace_id: str) -> str:
+    """
+    Return a version of workspace_id that is safe to use as a single directory
+    component on Windows (and POSIX).
+
+    All characters that Windows forbids in file/directory names are replaced with
+    underscores.  Every other character - including ampersands, hashes, spaces,
+    percent signs, exclamation marks, etc. - is preserved as-is because Windows
+    allows them in file names and they carry user intent.
+
+    Also strips leading/trailing whitespace and dots (Windows ignores trailing
+    dots in directory names, which causes silent path mismatches).
+
+    A blank result after sanitization falls back to "global".
+    """
+    sanitized = "".join("_" if c in _WINDOWS_FILENAME_INVALID else c for c in workspace_id)
+    sanitized = sanitized.strip().strip(".")
+    return sanitized or "global"
+
+
 def memory_root(workspace_id: str | None = None) -> Path:
     """Return the memory root for the given workspace_id (or the one in config)."""
     if workspace_id is None:
         workspace_id = load().get("workspace_id", "global")
-    root = HUBRIS_HOME / workspace_id
+    root = HUBRIS_HOME / sanitize_workspace_id(workspace_id)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -140,27 +163,19 @@ def update(**kwargs: Any) -> dict[str, Any]:
     return cfg
 
 
-def parse_startup_args(argv: list[str]) -> tuple[str | None, str | None, bool]:
+def parse_startup_args(argv: list[str]) -> bool:
     """
     Parse HuBrIS-specific CLI arguments.
 
-    Recognised flags (order-independent, case-insensitive):
-      --adapter:<name>   Override config.json 'adapter' key ('copilot' or 'continue').
-      --session:<id>     Bind this instance to one specific session ID.
-      --configure        Open the startup config dialog before launching daemons.
-                         Also opens automatically when config.json is absent.
+    The only recognised flag is --configure, which forces the startup config
+    dialog open even when config.json already exists.  Adapter selection and
+    session binding are not accepted as CLI flags - they must be set through
+    the config UI and saved to config.json before the daemons launch.
 
-    Returns (adapter_override, session_id, configure).
+    Returns configure (bool).
     """
-    adapter_override: str | None = None
-    session_id: str | None = None
     configure: bool = False
     for arg in argv:
-        lower = arg.lower()
-        if lower.startswith("--adapter:"):
-            adapter_override = arg.split(":", 1)[1].strip()
-        elif lower.startswith("--session:"):
-            session_id = arg.split(":", 1)[1].strip()
-        elif lower == "--configure":
+        if arg.lower() == "--configure":
             configure = True
-    return adapter_override, session_id, configure
+    return configure

@@ -337,6 +337,21 @@ def show(cfg: dict) -> dict | None:
         anchor="w", pady=2
     )
 
+    # Watched workspaces
+    ws_frame = ttk.LabelFrame(tab_frontend, text="Watched Workspaces", padding=8)
+    ws_frame.pack(fill="x", pady=4)
+    ttk.Label(
+        ws_frame,
+        text="One workspace path per line. Sessions whose workspace is not listed are ignored.",
+        foreground="gray",
+        wraplength=500,
+        justify="left",
+    ).pack(anchor="w", pady=(0, 4))
+    watched_ws_text = tk.Text(ws_frame, height=5, width=55, wrap="none")
+    watched_ws_text.pack(fill="x")
+    _existing_watched = cfg.get("watched_workspaces", [])
+    watched_ws_text.insert("1.0", "\n".join(_existing_watched))
+
     # ================================================================
     # TAB 4: Sessions (select sessions to include in memory indexing)
     # ================================================================
@@ -547,6 +562,14 @@ def show(cfg: dict) -> dict | None:
         adapters["ghcp"] = dict(adapters.get("ghcp", {}))
         adapters["ghcp"]["workspace_storage_dir"] = ws_storage_var.get().strip()
         new_cfg["adapters"] = adapters
+
+        # Watched workspaces
+        raw_ws = watched_ws_text.get("1.0", "end").strip()
+        new_cfg["watched_workspaces"] = [
+            line.strip().replace("\\", "/")
+            for line in raw_ws.splitlines()
+            if line.strip()
+        ]
 
         # GHCP adapter context injection settings
         ghcp_adapter_cfg = dict(cfg.get("ghcp_adapter", {}))

@@ -10,7 +10,7 @@ SessionWatcher instance and all session-lifecycle logic:
   - Enforces session whitelist (opt-in) and workspace blacklist
 (the supervisor health-check thread detects the exit and backs off).
 
-Run with: python daemon_watcher.py [--adapter:<name>] [--session[:<id>]]
+Run with: python daemon_watcher.py
 """
 
 import importlib
@@ -178,7 +178,6 @@ _classify_failures: dict[str, int] = {}
 _last_changed_session: str | None = None
 
 # Session-binding state (set at startup from CLI args)
-_bound_session: str | None = None
 
 # The active SessionWatcher instance (set in main())
 _watcher: SessionWatcher | None = None
@@ -297,13 +296,19 @@ def _on_session_changed(session_id: str, adapter: SessionAdapter) -> None:
     Invoked by the watcher when a session file changes.
     Processes the delta: classify, update memory, check/restore anchor.
     """
+    cfg = _config.load()
+    root = _config.memory_root(cfg.get("workspace_id", "global"))
+
+    # Reload the whitelist from disk on every invocation so that sessions
+    # whitelisted via the config UI after daemon startup are picked up without
+    # requiring a daemon restart.
+    global _session_whitelist
+    _session_whitelist = _load_session_whitelist(root)
+
     # Whitelist check: only process sessions the user has explicitly opted in
     # via the config Sessions tab.
     if session_id not in _session_whitelist:
         return
-
-    cfg = _config.load()
-    root = _config.memory_root(cfg.get("workspace_id", "global"))
     workspace_id = adapter.get_session_workspace(session_id)
 
     # Skip sessions belonging to blacklisted workspaces.
@@ -313,11 +318,6 @@ def _on_session_changed(session_id: str, adapter: SessionAdapter) -> None:
     # If the adapter's workspace filter rejects this workspace, skip silently.
     if not adapter.workspace_id_allowed(workspace_id, cfg):
         return
-
-    # Explicit session binding (--session:<id> CLI flag): only process the bound session.
-    if _bound_session is not None:
-        if session_id != _bound_session:
-            return
 
     messages = adapter.read_messages(session_id)
     if not messages:
@@ -391,19 +391,11 @@ def _on_session_changed(session_id: str, adapter: SessionAdapter) -> None:
 def main() -> None:
     global _session_message_counts, _committed_counts
     global _session_whitelist, _message_blacklist, _workspace_blacklist, _classify_failures
-    global _bound_session, _watcher
+    global _watcher
 
+    # All configuration comes exclusively from config.json - the user saved it
+    # through the startup UI before any daemon was launched.
     cfg = _config.load()
-
-    # Parse CLI args via the shared config.parse_startup_args helper.
-    argv_adapter, argv_session_id, _configure = _config.parse_startup_args(sys.argv[1:])
-
-    if argv_adapter:
-        cfg["adapter"] = argv_adapter
-        _log.info("WATCHER DAEMON: adapter overridden via CLI -> '%s'", argv_adapter)
-    if argv_session_id:
-        _bound_session = argv_session_id
-        _log.info("WATCHER DAEMON: session bound via CLI -> %s", argv_session_id[:8])
 
     root = _config.memory_root(cfg.get("workspace_id", "global"))
 
@@ -469,6 +461,26 @@ def main() -> None:
 
     _watcher.start()
     _log.info("WATCHER DAEMON: started (PID %d)", os.getpid())
+
+    # Startup scan: process any whitelisted sessions that have messages above
+    # the stored high-water mark from before this daemon was last stopped.
+    # Without this, messages added while HuBrIS was off sit unprocessed until
+    # the user adds another message and the filesystem watcher fires.
+    _log.info("WATCHER DAEMON: running startup scan for catch-up messages")
+    for _startup_adapter in _watcher.get_adapters():
+        try:
+            _startup_sessions = _startup_adapter.list_historical_sessions()
+        except Exception as _exc:
+            _log.warning("WATCHER STARTUP SCAN: list_historical_sessions failed: %s", _exc)
+            continue
+        for _sid in _startup_sessions:
+            if _sid not in _session_whitelist:
+                continue
+            try:
+                _on_session_changed(_sid, _startup_adapter)
+            except Exception as _exc:
+                _log.warning("WATCHER STARTUP SCAN: error processing %s: %s", _sid[:8], _exc)
+    _log.info("WATCHER DAEMON: startup scan complete")
 
     # Stop event and signal handlers must be set up BEFORE watch-spec threads are
     # started, because those threads receive stop_event as an argument.

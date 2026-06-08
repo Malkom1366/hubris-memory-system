@@ -253,6 +253,19 @@ def init_db(root: Path | None = None) -> None:
                 ON subject_embeddings(subject_id);
             """
         )
+        # Schema migrations: add columns that were introduced after initial
+        # table creation. SQLite does not support ADD COLUMN IF NOT EXISTS,
+        # so we attempt each ALTER and silently ignore duplicate-column errors.
+        _migrations = [
+            "ALTER TABLE message_blacklist ADD COLUMN status TEXT NOT NULL DEFAULT 'blacklisted'",
+            "ALTER TABLE message_blacklist ADD COLUMN reason TEXT NOT NULL DEFAULT 'unknown'",
+        ]
+        for _sql in _migrations:
+            try:
+                conn.execute(_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
         _create_audit_triggers(conn)
         # Single-process recovery: any rows left in 'running' from a prior
         # crashed server cycle get reset back to 'pending' so they re-run.
