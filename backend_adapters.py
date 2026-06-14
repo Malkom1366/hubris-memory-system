@@ -72,7 +72,8 @@ def build_backend_adapter(cfg: dict) -> BackendAdapter:
     return cls(
         endpoint=bcfg.get("endpoint", "http://localhost:11434"),
         api_key=bcfg.get("api_key", ""),
-        timeout=float(bcfg.get("timeout", 600)),
+        timeout=float(bcfg.get("timeout", 90)),
+        start_timeout=float(bcfg.get("start_timeout", 600)),
     )
 
 

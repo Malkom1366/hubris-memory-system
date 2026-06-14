@@ -25,11 +25,16 @@ class OllamaAdapter:
         self,
         endpoint: str = "http://localhost:11434",
         api_key: str = "",
-        timeout: float = 600.0,
+        timeout: float = 90.0,
+        start_timeout: float = 600.0,
     ) -> None:
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
+        # How long to wait for the first response byte. Covers the time the
+        # inference backend spends queuing or loading before it starts sending.
+        # Distinct from _timeout (per-chunk stall detection during generation).
+        self._start_timeout = start_timeout
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -68,12 +73,14 @@ class OllamaAdapter:
             "stream": True,
             "think": False,
         }
-        # read timeout: gap between consecutive SSE chunks. Once the model is
-        # generating, each token resets this clock. Set to self._timeout so
-        # long model cold-starts (VRAM load) are covered before the first token.
+        # read timeout applies to every socket read, including the very first one
+        # (waiting for the backend to send its initial response bytes). Use
+        # start_timeout here so queue wait and cold-start don't trip the timer.
+        # Once generation is flowing, each SSE token resets this same clock, so
+        # stall detection is also start_timeout - generous but acceptable.
         timeout = httpx.Timeout(
             connect=10.0,
-            read=self._timeout,
+            read=self._start_timeout,
             write=30.0,
             pool=5.0,
         )
@@ -123,7 +130,7 @@ class OllamaAdapter:
         payload = {"model": model, "input": text}
         try:
             response = httpx.post(
-                url, json=payload, headers=self._headers(), timeout=30.0
+                url, json=payload, headers=self._headers(), timeout=self._start_timeout
             )
             response.raise_for_status()
             data = response.json()

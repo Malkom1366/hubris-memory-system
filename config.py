@@ -27,9 +27,15 @@ DEFAULTS: dict[str, Any] = {
         "ollama": {
             "endpoint": "http://localhost:11434",
             "api_key": "",
-            # SSE read timeout in seconds. Gap between consecutive chunks.
-            # Set high enough to cover model cold-start (VRAM load).
-            "timeout": 600,
+            # How long (seconds) to wait for the inference backend to send its
+            # first response byte. Covers any queue wait in front of the backend
+            # plus cold-start time (e.g. loading a large model into VRAM).
+            # Set this high enough that legitimate queue waits never time out.
+            "start_timeout": 600,
+            # Per-chunk read timeout (seconds) once the model is generating.
+            # Each SSE token resets this clock. Only fires if the model stalls
+            # mid-generation. 90s is generous for any real stall scenario.
+            "timeout": 90,
         },
     },
     # Coordinating meta-agent: subject detection, lifecycle, compaction decisions.
@@ -38,6 +44,31 @@ DEFAULTS: dict[str, Any] = {
     # Mechanical subagent: dross confirmation, tagging, format tasks.
     # Fast small model sufficient. 3B-7B recommended.
     "subagent_model": "qwen3:8b",
+    # ---------------------------------------------------------------------------
+    # Context window sizes (tokens). These are the primary knobs that control
+    # ALL derived size budgets below. Set each to the actual context window of
+    # the model you are running. When you upgrade hardware and load a larger
+    # model, raise the corresponding value here and all budgets scale up
+    # automatically without touching anything else.
+    #
+    # How to find the right value:
+    #   - Ollama model page / README (e.g. "phi4-reasoning-8k" -> 8192)
+    #   - `ollama show <model>` -> look for "context length" in the output
+    #   - When in doubt, use a conservative (smaller) number - the system
+    #     degrades gracefully; it just truncates more aggressively.
+    # ---------------------------------------------------------------------------
+    # Subagent model context window (tokens). Drives: content_max_chars.
+    # Set to the context length of your subagent_model.
+    # Find it with: ollama show <model> | grep context
+    "subagent_context_tokens": 4096,
+    # Meta model context window (tokens). Drives: finalize_max_chars, escalation_token_max.
+    # Set to the context length of your meta_model. Can be larger than subagent if your
+    # meta model supports it; default is conservative for modest hardware.
+    "meta_context_tokens": 4096,
+    # Embedding model context (tokens). Drives: embed_chunk_size, embed_chunk_overlap.
+    # nomic-embed-text default in Ollama is 2048. mxbai-embed-large is also 512-dim
+    # but check its context; set higher if your model supports it.
+    "embed_context_tokens": 2048,
     # Embedding model for semantic recall. Must be pulled in Ollama.
     # Set to "" to disable vectorization entirely.
     "embed_model": "nomic-embed-text",
@@ -99,11 +130,72 @@ DEFAULTS: dict[str, Any] = {
     "reconcile_delta_contradicts": -0.10,
     "reconcile_delta_updates": -0.20,
     # Maximum characters of ranked source messages included in the finalize prompt.
-    # Messages are appended in descending (confidence, recency) order until this
-    # limit is reached. Lower values yield shorter LLM calls; raise when using a
-    # model that handles longer context comfortably.
-    "finalize_max_chars": 6000,
+    # Computed automatically from meta_context_tokens by compute_budgets().
+    # Override here only if you want a fixed cap regardless of context size.
+    # "finalize_max_chars": 10384,
 }
+
+# ---------------------------------------------------------------------------
+# Budget computation
+# ---------------------------------------------------------------------------
+
+def compute_budgets(cfg: dict[str, Any]) -> dict[str, Any]:
+    """
+    Derive all LLM prompt size limits from model-specific context window sizes,
+    filling derived keys into cfg only when they are absent.
+
+    Each model's budget is computed independently so prompts never exceed that
+    model's context window. Explicit values already in cfg are never overwritten.
+
+    Derivation rationale (all token counts assume 4 chars per token):
+
+    content_max_chars  (subagent - total message block budget)
+      Reserve ~1500 tokens for system prompt, structured fields, and response.
+      The remaining tokens are available for message content. Callers divide
+      this proportionally across however many messages are in the prompt, so
+      total content always stays within budget regardless of message count.
+      => (sa_ctx - 1500) * 4  chars
+
+    finalize_max_chars  (meta - total message block budget for finalize/summarize)
+      Same reservation formula, derived from meta model's context.
+      => (mt_ctx - 1500) * 4  chars
+
+    escalation_token_max  (meta - input token budget for escalation prompt)
+      Reserve 600 tokens for system prompt, subjects list, and response.
+      => mt_ctx - 600  tokens
+
+    embed_chunk_size  (embed model - chars per chunk)
+      65% of embed context. Keeps 35% headroom so the Ollama
+      "exceeds context length" 400 error cannot fire.
+      => emb_ctx * 65 // 100 * 4  chars
+
+    embed_chunk_overlap  (overlap between adjacent embed chunks)
+      10% of chunk_size preserves boundary context.
+      => embed_chunk_size // 10  chars
+    """
+    sa_ctx  = int(cfg.get("subagent_context_tokens", 4096))
+    mt_ctx  = int(cfg.get("meta_context_tokens", 4096))
+    emb_ctx = int(cfg.get("embed_context_tokens", 2048))
+
+    out = dict(cfg)
+
+    if "content_max_chars" not in cfg:
+        out["content_max_chars"] = max(500, (sa_ctx - 1500) * 4)
+
+    if "finalize_max_chars" not in cfg:
+        out["finalize_max_chars"] = max(1000, (mt_ctx - 1500) * 4)
+
+    if "escalation_token_max" not in cfg:
+        out["escalation_token_max"] = max(500, mt_ctx - 600)
+
+    if "embed_chunk_size" not in cfg:
+        out["embed_chunk_size"] = max(500, emb_ctx * 65 // 100 * 4)
+
+    if "embed_chunk_overlap" not in cfg:
+        chunk_size = int(out.get("embed_chunk_size", 5324))
+        out["embed_chunk_overlap"] = max(50, chunk_size // 10)
+
+    return out
 
 _WINDOWS_FILENAME_INVALID = frozenset('\\/:*?"<>|')
 
@@ -140,12 +232,12 @@ def memory_root(workspace_id: str | None = None) -> Path:
 def load() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         save(DEFAULTS.copy())
-        return DEFAULTS.copy()
+        return compute_budgets(DEFAULTS.copy())
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
     merged = DEFAULTS.copy()
     merged.update(data)
-    return merged
+    return compute_budgets(merged)
 
 
 def save(cfg: dict[str, Any]) -> None:
