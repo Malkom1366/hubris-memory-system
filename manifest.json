@@ -62,6 +62,13 @@
       "description": "Detects agreement, contradiction, and supersession between memories sharing the same subject using vector similarity.",
       "restart": "always",
       "health_check_interval_s": 5
+    },
+    {
+      "name": "embed",
+      "module": "daemon_embed",
+      "description": "Embeds messages and subject memory into vec_messages / vec_subjects for semantic recall. Requires embed_model to be configured.",
+      "restart": "always",
+      "health_check_interval_s": 5
     }
   ]
 }

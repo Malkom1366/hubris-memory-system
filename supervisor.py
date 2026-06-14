@@ -48,6 +48,10 @@ _daemon_processes: dict[str, subprocess.Popen] = {}
 _daemon_specs: list[dict] = []
 _shutdown_event = threading.Event()
 
+# PID of the server process that launched this supervisor.
+# When this PID dies the health loop triggers a graceful shutdown.
+_parent_pid: int | None = None
+
 
 # ---------------------------------------------------------------------------
 # Daemon lifecycle
@@ -117,6 +121,17 @@ def _kill_orphan_daemons() -> None:
 def _health_check_loop() -> None:
     """Monitor daemon processes and restart any that have exited unexpectedly."""
     while not _shutdown_event.is_set():
+        # Parent PID watchdog: if the server process that launched us has died
+        # (e.g. VS Code killed it without running atexit handlers), shut down
+        # all daemons gracefully instead of leaving them as orphans.
+        if _parent_pid is not None and not _pid_is_alive(_parent_pid):
+            _log.info(
+                "SUPERVISOR: parent PID %d is gone - initiating graceful shutdown",
+                _parent_pid,
+            )
+            shutdown()
+            return
+
         interval = min(
             (spec.get("health_check_interval_s", 5.0) for spec in _daemon_specs),
             default=5.0,
@@ -271,7 +286,7 @@ def _acquire_lock() -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def launch() -> bool:
+def launch(parent_pid: int | None = None) -> bool:
     """
     Start all discovered daemons and kick off the health-check thread.
 
@@ -279,11 +294,15 @@ def launch() -> bool:
     from config.json, which the user saved through the startup UI before this
     is called.  No CLI arguments are forwarded to daemons.
 
+    parent_pid: PID of the calling server process. When this PID dies the
+    health loop triggers a graceful daemon shutdown. Defaults to os.getppid().
+
     Returns True if this process acquired the supervisor lock and launched the
     daemons.  Returns False if another supervisor is already running; in that
     case server.py should serve MCP tools only.
     """
-    global _daemon_specs
+    global _daemon_specs, _parent_pid
+    _parent_pid = parent_pid if parent_pid is not None else os.getppid()
     if not _acquire_lock():
         _log.warning(
             "SUPERVISOR: another process holds %s - "
@@ -318,5 +337,8 @@ def launch() -> bool:
         daemon=True,
     )
     health_thread.start()
-    _log.info("SUPERVISOR: health-check thread started (PID %d)", os.getpid())
+    _log.info(
+        "SUPERVISOR: health-check thread started (PID %d, watching parent PID %d)",
+        os.getpid(), _parent_pid,
+    )
     return True

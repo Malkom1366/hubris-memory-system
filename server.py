@@ -32,6 +32,7 @@ Add to ~/.continue/config.json under "mcpServers".
 """
 
 import sys
+import os
 from pathlib import Path
 
 import supervisor as _supervisor
@@ -138,7 +139,7 @@ if __name__ == "__main__":
     for _install_adapter in _active_adapters:
         _install_adapter.install_rules(_cfg)
 
-    if _supervisor.launch():
+    if _supervisor.launch(parent_pid=os.getpid()):
         _log.info("SUPERVISOR: primary - daemons launched")
     else:
         _log.warning("SUPERVISOR: secondary - MCP tools only (daemons managed by another process)")

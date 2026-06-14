@@ -189,6 +189,20 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# Last-resort fallback for content_max_chars when a raw cfg dict that bypassed
+# config.load() is passed to update_subject_memory or generate_subject_summary.
+# Under normal operation config.load() computes this from subagent_context_tokens
+# via compute_budgets() and this constant is never reached.
+_DEFAULT_CONTENT_MAX_CHARS = 2000
+
+
+def _cap_content(text: str, max_chars: int) -> str:
+    """Truncate text to max_chars, appending an ellipsis marker when cut."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + " [...truncated]"
+
+
 class ClassifyFailed(Exception):
     """Raised when the LLM classify call fails and no assignments can be made."""
 
@@ -197,11 +211,10 @@ class ClassifyFailed(Exception):
         self.is_transient = is_transient
 
 
-# Messages per classify LLM call. Classify is fully async so there is no
-# cost to smaller batches. Small batches stay well within any model context
-# window and limit retry surface when a batch fails.
-# Overridable via config key "classify_batch_size".
-_CLASSIFY_BATCH_SIZE = 10
+# Messages per classify LLM call. One message per call ensures each message
+# receives the full available token budget of the subagent model rather than
+# sharing budget with other messages in the same prompt.
+_CLASSIFY_BATCH_SIZE = 1
 
 
 def _classify_batch(
@@ -215,8 +228,9 @@ def _classify_batch(
     (batch_start + local index), whose value is a {subject_id: relevance}
     map (possibly empty). Raises ClassifyFailed on any error.
     """
+    content_budget = int(cfg.get("content_max_chars", _DEFAULT_CONTENT_MAX_CHARS))
     messages_text = json.dumps(
-        [{"index": i, "role": m["role"], "content": m["content"][:500]}
+        [{"index": i, "role": m["role"], "content": m["content"][:content_budget]}
          for i, m in enumerate(batch)],
         ensure_ascii=False,
     )
@@ -298,14 +312,14 @@ def classify_messages(
          for s in known_subjects],
         ensure_ascii=False,
     )
-    batch_size = max(1, int(cfg.get("classify_batch_size", _CLASSIFY_BATCH_SIZE)))
+    batch_size = 1
     batches = [
         messages_delta[i:i + batch_size]
         for i in range(0, len(messages_delta), batch_size)
     ]
     _log.info(
-        "CLASSIFY %d msg(s) against %d subject(s) in %d batch(es) of %d -> subagent_model=%s",
-        len(messages_delta), len(known_subjects), len(batches), batch_size,
+        "CLASSIFY %d msg(s) against %d subject(s) one at a time -> subagent_model=%s",
+        len(messages_delta), len(known_subjects),
         cfg.get("subagent_model", "?"),
     )
 
@@ -437,8 +451,12 @@ def escalate_unassigned(
          for s in known_subjects],
         ensure_ascii=False,
     )
+    # Derive per-message content cap from the meta model's budget.
+    # Reserve 600 tokens for system prompt, subjects list, and response headers.
+    mt_ctx = int(cfg.get("meta_context_tokens", 4096))
+    msg_content_chars = max(100, (mt_ctx - 600) * 4 // max(1, len(messages)))
     messages_text = json.dumps(
-        [{"index": i, "role": m["role"], "content": m["content"][:500]}
+        [{"index": i, "role": m["role"], "content": m["content"][:msg_content_chars]}
          for i, m in enumerate(messages)],
         ensure_ascii=False,
     )
@@ -494,8 +512,11 @@ def generate_subject_summary(
     if not messages:
         return ""
 
+    content_budget = int(cfg.get("content_max_chars", _DEFAULT_CONTENT_MAX_CHARS))
+    per_msg = max(100, content_budget // max(1, len(messages)))
     block_text = "\n\n".join(
-        f"[{m['role'].upper()}]: {m['content']}" for m in messages
+        f"[{m['role'].upper()}]: {_cap_content(m['content'], per_msg)}"
+        for m in messages
     )
     user_prompt = (
         f"Subject: {subject_name}\n\n"
@@ -536,8 +557,11 @@ def update_subject_memory(
     if not new_messages:
         return existing_view, "", "established" if not existing_view else "extended"
 
+    content_budget = int(cfg.get("content_max_chars", _DEFAULT_CONTENT_MAX_CHARS))
+    per_msg = max(100, content_budget // max(1, len(new_messages)))
     msgs_text = "\n\n".join(
-        f"[{m['role'].upper()} relevance={float(m.get('relevance', 1.0)):.2f}]: {m['content']}"
+        f"[{m['role'].upper()} relevance={float(m.get('relevance', 1.0)):.2f}]: "
+        f"{_cap_content(m['content'], per_msg)}"
         for m in new_messages
     )
     sections: list[str] = []

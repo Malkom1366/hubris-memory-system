@@ -441,22 +441,79 @@ def main() -> None:
     watcher_lock_path = _config.HUBRIS_HOME / "watcher.lock"
     _config.HUBRIS_HOME.mkdir(parents=True, exist_ok=True)
     watcher_lock_fh = None
-    try:
-        watcher_lock_fh = open(watcher_lock_path, "a+b")
-        msvcrt.locking(watcher_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
-        watcher_lock_fh.seek(0)
-        watcher_lock_fh.truncate()
-        watcher_lock_fh.write(str(os.getpid()).encode("ascii"))
-        watcher_lock_fh.flush()
-    except OSError:
+
+    def _try_acquire_watcher_lock() -> bool:
+        """
+        Attempt to acquire watcher.lock.  Returns True on success.
+
+        On failure, checks daemon_pids.json for a recorded watcher PID.
+        If that PID is still alive it is terminated (orphan from a previous
+        server session whose atexit handlers never ran).  After killing the
+        orphan the lock acquisition is retried once.  If the retry also fails
+        (a genuinely live competing watcher) we exit cleanly.
+        """
+        nonlocal watcher_lock_fh
+        for attempt in range(2):
+            try:
+                watcher_lock_fh = open(watcher_lock_path, "a+b")
+                msvcrt.locking(watcher_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+                watcher_lock_fh.seek(0)
+                watcher_lock_fh.truncate()
+                watcher_lock_fh.write(str(os.getpid()).encode("ascii"))
+                watcher_lock_fh.flush()
+                return True
+            except OSError:
+                if watcher_lock_fh is not None:
+                    try:
+                        watcher_lock_fh.close()
+                    except OSError:
+                        pass
+                    watcher_lock_fh = None
+                if attempt > 0:
+                    break
+                # First failure: try to kill the recorded watcher PID.
+                daemon_pids_path = _config.HUBRIS_HOME / "daemon_pids.json"
+                orphan_pid: int | None = None
+                try:
+                    pids: dict = json.loads(daemon_pids_path.read_text(encoding="ascii"))
+                    orphan_pid = int(pids.get("watcher", 0)) or None
+                except Exception:
+                    pass
+                if orphan_pid is None:
+                    break  # no recorded PID - genuinely contested, give up
+                try:
+                    _HAVE_PSUTIL = False
+                    try:
+                        import psutil as _psutil_local  # type: ignore[import]
+                        _HAVE_PSUTIL = True
+                    except ImportError:
+                        pass
+                    if _HAVE_PSUTIL:
+                        p = _psutil_local.Process(orphan_pid)
+                        p.terminate()
+                        try:
+                            p.wait(timeout=3)
+                        except _psutil_local.TimeoutExpired:
+                            p.kill()
+                    else:
+                        os.kill(orphan_pid, 9)
+                    _log.warning(
+                        "WATCHER DAEMON: killed orphan watcher PID %d from previous session",
+                        orphan_pid,
+                    )
+                    import time as _time
+                    _time.sleep(0.2)  # brief pause for OS to release the lock
+                except (ProcessLookupError, OSError):
+                    break  # orphan already dead but lock still held - give up
+                except Exception as exc:
+                    _log.warning("WATCHER DAEMON: could not kill orphan PID %d: %s", orphan_pid, exc)
+                    break
+        return False
+
+    if not _try_acquire_watcher_lock():
         _log.warning(
             "WATCHER DAEMON: watcher.lock held by another process - exiting (exit code 1)"
         )
-        if watcher_lock_fh is not None:
-            try:
-                watcher_lock_fh.close()
-            except OSError:
-                pass
         sys.exit(1)
 
     _watcher.start()

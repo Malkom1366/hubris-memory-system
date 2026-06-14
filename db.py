@@ -1003,8 +1003,17 @@ def get_links_pending_reconciliation(
     root: Path | None = None,
 ) -> list[dict]:
     """
-    Return semantic_links rows where reconciled_at IS NULL, ordered by
-    created_date_utc ascending (oldest unreconciled first).
+    Return semantic_links rows where reconciled_at IS NULL and the linked
+    message is ready for comparison - meaning either:
+      (a) the message has at least one row in message_chunks (it has been
+          chunked/embedded and neighbors can be found), or
+      (b) the message is empty (reconcile handles it inline without needing
+          the vector index).
+
+    This gate prevents reconcile_link actions from being enqueued prematurely.
+    A non-empty message with no chunks yet would always find zero older
+    neighbors and be trivially marked reconciled, throwing away the comparison
+    opportunity permanently.
 
     Each returned dict has: id, message_id, subject_id, confidence,
     created_date_utc.
@@ -1013,10 +1022,24 @@ def get_links_pending_reconciliation(
     with connect(root) as conn:
         rows = conn.execute(
             """
-            SELECT id, message_id, subject_id, confidence, created_date_utc
-            FROM semantic_links
-            WHERE reconciled_at IS NULL
-            ORDER BY created_date_utc ASC
+            SELECT sl.id, sl.message_id, sl.subject_id, sl.confidence,
+                   sl.created_date_utc
+            FROM semantic_links sl
+            WHERE sl.reconciled_at IS NULL
+              AND (
+                  -- message has been chunked: ready for vector neighbor search
+                  EXISTS (
+                      SELECT 1 FROM message_chunks mc
+                      WHERE mc.message_id = sl.message_id
+                  )
+                  -- OR message is empty: reconcile marks it done inline
+                  OR NOT EXISTS (
+                      SELECT 1 FROM autobiographical_memory am
+                      WHERE am.id = sl.message_id
+                        AND length(trim(coalesce(am.raw_content, ''))) > 0
+                  )
+              )
+            ORDER BY sl.created_date_utc ASC
             """
         ).fetchall()
     return [
@@ -1782,26 +1805,39 @@ def get_messages_fully_covered(
 
 def _maybe_create_vec_table(conn: sqlite3.Connection) -> None:
     """
-    Create the vec_messages virtual table if sqlite-vec is installed.
+    Create the vec_messages / vec_subjects / vec_message_chunks virtual tables
+    if sqlite-vec is installed.  Also ensures the message_chunks companion
+    table exists (regular table; no extension required for it).
     Called from init_db(); silently skips if the extension is unavailable.
     """
     import embeddings as _emb  # lazy import - embeddings is optional
+    # message_chunks is a regular table - create it regardless of sqlite-vec.
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_chunks (
+                id          INTEGER PRIMARY KEY,
+                message_id  TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                UNIQUE (message_id, chunk_index)
+            )
+            """
+        )
+    except sqlite3.OperationalError as exc:
+        _log.debug("Could not create message_chunks table: %s", exc)
     if not _emb.is_available():
         return
     if not _emb.load_extension(conn):
         return
-    try:
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_messages USING vec0(embedding float[768])"
-        )
-    except sqlite3.OperationalError as exc:
-        _log.debug("Could not create vec_messages table: %s", exc)
-    try:
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_subjects USING vec0(embedding float[768])"
-        )
-    except sqlite3.OperationalError as exc:
-        _log.debug("Could not create vec_subjects table: %s", exc)
+    for tbl, ddl in (
+        ("vec_messages",       "CREATE VIRTUAL TABLE IF NOT EXISTS vec_messages USING vec0(embedding float[768])"),
+        ("vec_subjects",       "CREATE VIRTUAL TABLE IF NOT EXISTS vec_subjects USING vec0(embedding float[768])"),
+        ("vec_message_chunks", "CREATE VIRTUAL TABLE IF NOT EXISTS vec_message_chunks USING vec0(embedding float[768])"),
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError as exc:
+            _log.debug("Could not create %s table: %s", tbl, exc)
 
 
 def connect_vec(root: Path | None = None) -> tuple[sqlite3.Connection, bool]:
@@ -1841,6 +1877,59 @@ def get_messages_needing_embedding(
     return [dict(row) for row in rows]
 
 
+def get_sessions_needing_chunking(root: Path | None = None) -> list[str]:
+    """
+    Return a list of session_ids that have at least one non-empty message
+    not yet present in message_chunks.
+
+    Used by daemon_embed's scanner to decide which embed_messages actions
+    to enqueue.
+    """
+    init_db(root)
+    with connect(root) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT am.session_id
+            FROM autobiographical_memory am
+            WHERE am.raw_content IS NOT NULL
+              AND length(trim(am.raw_content)) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_chunks mc WHERE mc.message_id = am.id
+              )
+            """
+        ).fetchall()
+    return [str(r["session_id"]) for r in rows]
+
+
+def get_messages_needing_chunking(
+    session_id: str,
+    limit: int,
+    root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Return up to `limit` non-empty messages from `session_id` that have no
+    entry in message_chunks yet, ordered by message_index ascending.
+    """
+    init_db(root)
+    with connect(root) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, message_index, speaker, raw_content
+            FROM autobiographical_memory
+            WHERE session_id = ?
+              AND raw_content IS NOT NULL
+              AND length(trim(raw_content)) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_chunks mc WHERE mc.message_id = id
+              )
+            ORDER BY message_index
+            LIMIT ?
+            """,
+            (session_id, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def upsert_message_embeddings_batch(
     embeddings_by_rowid: dict[int, bytes],
     root: Path | None = None,
@@ -1871,14 +1960,64 @@ def upsert_message_embeddings_batch(
     return count
 
 
+def upsert_message_chunk_embeddings(
+    message_id: str,
+    embeddings: list[bytes],
+    root: Path | None = None,
+) -> int:
+    """
+    Insert or replace chunk embeddings for a message.
+
+    Each element of `embeddings` corresponds to chunk_index 0, 1, 2, ...
+    Rows are written to message_chunks (regular table) and vec_message_chunks
+    (sqlite-vec virtual table) atomically per chunk.
+
+    Returns the number of chunks successfully written.
+    """
+    if not embeddings:
+        return 0
+    conn, loaded = connect_vec(root)
+    if not loaded:
+        return 0
+    count = 0
+    try:
+        for chunk_index, emb_bytes in enumerate(embeddings):
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO message_chunks (message_id, chunk_index)
+                    VALUES (?, ?)
+                    ON CONFLICT (message_id, chunk_index) DO NOTHING
+                    """,
+                    (message_id, chunk_index),
+                )
+                chunk_id = conn.execute(
+                    "SELECT id FROM message_chunks WHERE message_id = ? AND chunk_index = ?",
+                    (message_id, chunk_index),
+                ).fetchone()["id"]
+                conn.execute(
+                    "INSERT OR REPLACE INTO vec_message_chunks(rowid, embedding) VALUES (?, ?)",
+                    (chunk_id, emb_bytes),
+                )
+                count += 1
+            except Exception as exc:
+                _log.debug(
+                    "chunk upsert failed for message=%s chunk=%d: %s",
+                    message_id[:8], chunk_index, exc,
+                )
+        conn.commit()
+    except Exception as exc:
+        _log.debug("chunk batch upsert failed for message=%s: %s", message_id[:8], exc)
+    return count
+
+
 def semantic_search_messages(
     embedding_bytes: bytes,
     k: int = 10,
     root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """
-    KNN search over vec_messages, joined back to autobiographical_memory
-    and semantic_subjects (via the highest-confidence semantic_link).
+    KNN search over vec_message_chunks, deduped to one result per message.
 
     Returns up to k results sorted by cosine distance (nearest first), each as
     a dict with keys: id, session_id, message_index, speaker, raw_content,
@@ -1892,8 +2031,16 @@ def semantic_search_messages(
             """
             WITH knn AS (
                 SELECT rowid, distance
-                FROM vec_messages
+                FROM vec_message_chunks
                 WHERE embedding MATCH ?
+                ORDER BY distance
+                LIMIT ?
+            ),
+            best_per_message AS (
+                SELECT mc.message_id, MIN(knn.distance) AS distance
+                FROM knn
+                JOIN message_chunks mc ON mc.id = knn.rowid
+                GROUP BY mc.message_id
                 ORDER BY distance
                 LIMIT ?
             )
@@ -1904,11 +2051,11 @@ def semantic_search_messages(
                 am.speaker,
                 am.raw_content,
                 am.timestamp_utc,
-                knn.distance,
+                bpm.distance,
                 ss.name AS subject_name,
                 sl.created_date_utc AS link_created_date
-            FROM knn
-            JOIN autobiographical_memory am ON am.rowid = knn.rowid
+            FROM best_per_message bpm
+            JOIN autobiographical_memory am ON am.id = bpm.message_id
             LEFT JOIN semantic_links sl ON sl.id = (
                 SELECT l2.id FROM semantic_links l2
                 WHERE l2.message_id = am.id
@@ -1916,9 +2063,9 @@ def semantic_search_messages(
                 LIMIT 1
             )
             LEFT JOIN semantic_subjects ss ON ss.id = sl.subject_id
-            ORDER BY knn.distance
+            ORDER BY bpm.distance
             """,
-            (embedding_bytes, k),
+            (embedding_bytes, k * 30, k),
         ).fetchall()
         return [dict(row) for row in rows]
     except Exception as exc:
@@ -1933,7 +2080,8 @@ def semantic_search_subject_messages(
     root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """
-    KNN search over vec_messages scoped to messages linked to a single subject.
+    KNN search over vec_message_chunks scoped to a single subject, deduped to
+    one result per message (best chunk distance wins).
 
     Used by daemon_reconcile to find messages within a subject that are
     semantically close to a new arrival. Returns up to k results sorted by
@@ -1947,17 +2095,26 @@ def semantic_search_subject_messages(
     try:
         rows = conn.execute(
             """
-            WITH subject_rowids AS (
-                SELECT am.rowid AS msg_rowid
-                FROM semantic_links sl
-                JOIN autobiographical_memory am ON am.id = sl.message_id
+            WITH subject_chunk_rowids AS (
+                SELECT mc.id AS chunk_rowid, mc.message_id
+                FROM message_chunks mc
+                JOIN autobiographical_memory am ON am.id = mc.message_id
+                JOIN semantic_links sl ON sl.message_id = am.id
                 WHERE sl.subject_id = ?
             ),
             knn AS (
                 SELECT rowid, distance
-                FROM vec_messages
+                FROM vec_message_chunks
                 WHERE embedding MATCH ?
-                AND rowid IN (SELECT msg_rowid FROM subject_rowids)
+                  AND rowid IN (SELECT chunk_rowid FROM subject_chunk_rowids)
+                ORDER BY distance
+                LIMIT ?
+            ),
+            best_per_message AS (
+                SELECT scr.message_id, MIN(knn.distance) AS distance
+                FROM knn
+                JOIN subject_chunk_rowids scr ON scr.chunk_rowid = knn.rowid
+                GROUP BY scr.message_id
                 ORDER BY distance
                 LIMIT ?
             )
@@ -1968,16 +2125,16 @@ def semantic_search_subject_messages(
                 am.speaker,
                 am.raw_content,
                 am.timestamp_utc,
-                knn.distance,
+                bpm.distance,
                 sl.id AS link_id,
                 sl.created_date_utc AS link_created_date,
                 sl.confidence AS link_confidence
-            FROM knn
-            JOIN autobiographical_memory am ON am.rowid = knn.rowid
+            FROM best_per_message bpm
+            JOIN autobiographical_memory am ON am.id = bpm.message_id
             JOIN semantic_links sl ON sl.message_id = am.id AND sl.subject_id = ?
-            ORDER BY knn.distance
+            ORDER BY bpm.distance
             """,
-            (subject_id, embedding_bytes, k, subject_id),
+            (subject_id, embedding_bytes, k * 30, k, subject_id),
         ).fetchall()
         return [dict(row) for row in rows]
     except Exception as exc:

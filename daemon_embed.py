@@ -48,8 +48,8 @@ _SUBJECTS_BATCH = 20
 
 def _scan_messages_needing_embedding(root: Path) -> list[dict]:
     """
-    Return embed_messages items for sessions whose total message count exceeds
-    the vectorized_count HWM.
+    Return embed_messages items for sessions that have at least one non-empty
+    message not yet present in message_chunks.
 
     Each item shape:
       subject_id - session_id, used as the dedup key in memory_actions
@@ -61,21 +61,15 @@ def _scan_messages_needing_embedding(root: Path) -> list[dict]:
     if not _emb.is_available():
         return []
     try:
-        vectorized = _db.load_vectorized_counts(root)
-        totals = _db.get_session_message_counts(root)
+        sessions = _db.get_sessions_needing_chunking(root)
     except Exception as exc:
         _log.warning("EMBED scan (messages): DB query failed: %s", exc)
         return []
 
-    items = []
-    for session_id, total in totals.items():
-        hwm = vectorized.get(session_id, 0)
-        if total > hwm:
-            items.append({
-                "subject_id": session_id,
-                "payload": {"session_id": session_id},
-            })
-    return items
+    return [
+        {"subject_id": session_id, "payload": {"session_id": session_id}}
+        for session_id in sessions
+    ]
 
 
 def _scan_subjects_needing_embedding(root: Path) -> list[dict]:
@@ -113,11 +107,15 @@ def _handle_embed_messages(
     payload: dict,
 ) -> None:
     """
-    Embed up to _MESSAGES_BATCH un-vectorized messages for one session.
+    Chunk and embed up to _MESSAGES_BATCH un-chunked messages for one session.
 
-    Reads the vectorized_count HWM fresh from DB so stale payloads never cause
-    double-embedding. Advances the HWM after each successful batch.
-    Stops on the first embed failure so the next cycle retries from there.
+    Each non-empty message is split into overlapping character chunks and each
+    chunk gets its own embedding row in vec_message_chunks (keyed through
+    message_chunks). Short messages produce a single chunk; long messages
+    produce multiple, so every part of the message is searchable.
+
+    Stops on the first embed failure so the next cycle retries from that
+    message onward.
     """
     if not _emb.is_available():
         return
@@ -126,39 +124,30 @@ def _handle_embed_messages(
         return
 
     session_id: str = payload["session_id"]
-    vectorized = _db.load_vectorized_counts(root)
-    from_index = vectorized.get(session_id, 0)
-
-    rows = _db.get_messages_needing_embedding(session_id, from_index, _MESSAGES_BATCH, root)
+    rows = _db.get_messages_needing_chunking(session_id, _MESSAGES_BATCH, root)
     if not rows:
         return
 
-    embeddings_by_rowid: dict[int, bytes] = {}
-    highest_index = from_index
+    embedded_messages = 0
+    total_chunks = 0
     for row in rows:
         text = str(row.get("raw_content") or "").strip()
         if not text:
-            # Advance past empty/null messages without embedding them.
-            highest_index = max(highest_index, int(row["message_index"]) + 1)
-            continue
-        emb_bytes = _emb.embed(text, cfg)
-        if emb_bytes is None:
-            # Embedding failed (model not loaded, Ollama down, etc.).
-            # Stop here so we retry this message on the next cycle.
+            continue  # scan excludes empty messages; belt-and-suspenders guard
+        chunk_embeddings = _emb.embed_chunks(text, cfg)
+        if not chunk_embeddings:
+            # Embedding failed - stop here so we retry this message next cycle.
             break
-        embeddings_by_rowid[int(row["rowid"])] = emb_bytes
-        highest_index = max(highest_index, int(row["message_index"]) + 1)
+        written = _db.upsert_message_chunk_embeddings(str(row["id"]), chunk_embeddings, root)
+        if written:
+            embedded_messages += 1
+            total_chunks += written
 
-    if embeddings_by_rowid:
-        _db.upsert_message_embeddings_batch(embeddings_by_rowid, root)
+    if embedded_messages:
         _log.debug(
-            "EMBED MESSAGES %s: embedded %d message(s) (HWM %d -> %d)",
-            session_id[:8], len(embeddings_by_rowid), from_index, highest_index,
+            "EMBED MESSAGES %s: %d message(s) -> %d chunk(s) written",
+            session_id[:8], embedded_messages, total_chunks,
         )
-
-    if highest_index > from_index:
-        vectorized[session_id] = highest_index
-        _db.save_vectorized_counts(vectorized, _db.ACTOR_EMBEDDING_WRITER, root)
 
 
 def _handle_embed_subjects(

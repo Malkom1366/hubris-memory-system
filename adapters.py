@@ -10,6 +10,8 @@ Contents:
   ContinueAdapter  - Reads ~/.continue/sessions/*.json (Continue AI).
   VSCodeCopilotAdapter - Reads VS Code workspaceStorage JSONL transcripts
                          (GitHub Copilot Chat).
+  KoboldCppAdapter - Reads KoboldCPP/Kobold Lite conversation save files
+                     (cfg['saves_dir'] required).
   build_frontend_adapter(cfg) - Factory: reads 'adapter' from a config dict
                                 and returns the correct concrete adapter.
                                 This is the preferred instantiation path;
@@ -31,6 +33,8 @@ import json
 import os
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+
+from frontend_adapter_koboldcpp import KoboldCppAdapter
 
 
 @runtime_checkable
@@ -428,10 +432,13 @@ def build_frontend_adapter(cfg: dict) -> SessionAdapter:
     Return the configured front-end session adapter.
 
     Reads 'adapter' from cfg. Recognised values:
-      'continue' - ContinueAdapter reading ~/.continue/sessions/ (or
-                   cfg['sessions_dir'] if set).
-      'copilot'  - VSCodeCopilotAdapter reading VS Code workspaceStorage
-                   JSONL transcripts (cfg['workspace_storage_dir'] if set).
+      'continue'   - ContinueAdapter reading ~/.continue/sessions/ (or
+                     cfg['sessions_dir'] if set).
+      'copilot'    - VSCodeCopilotAdapter reading VS Code workspaceStorage
+                     JSONL transcripts (cfg['workspace_storage_dir'] if set).
+      'koboldcpp'  - KoboldCppAdapter reading KoboldCPP/Kobold Lite save files
+                     from cfg['saves_dir'] (required; falls back to cwd with a
+                     warning if not set).
 
     Raises ValueError for any unrecognised adapter name.
     """
@@ -441,6 +448,8 @@ def build_frontend_adapter(cfg: dict) -> SessionAdapter:
         return VSCodeCopilotAdapter(workspace_storage_dir=wsd)
     if name == "continue":
         return ContinueAdapter(sessions_dir=cfg.get("sessions_dir"))
+    if name == "koboldcpp":
+        return KoboldCppAdapter(saves_dir=cfg.get("saves_dir"))
     raise ValueError(
-        f"Unknown frontend adapter: {name!r}. Expected 'continue' or 'copilot'."
+        f"Unknown frontend adapter: {name!r}. Expected 'continue', 'copilot', or 'koboldcpp'."
     )

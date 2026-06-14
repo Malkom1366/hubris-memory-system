@@ -80,6 +80,7 @@ def show(cfg: dict) -> dict | None:
     tab_backend = ttk.Frame(notebook, padding=10)
     notebook.add(tab_backend, text="Backend")
     tab_backend.columnconfigure(1, weight=1)
+    tab_backend.columnconfigure(3, minsize=120)
 
     # Adapter selection
     adapter_names = sorted(_REGISTRY.keys())
@@ -128,10 +129,13 @@ def show(cfg: dict) -> dict | None:
         row=4, column=0, columnspan=3, sticky="ew", pady=8
     )
 
-    # Model dropdowns
+    # Model dropdowns and per-model context window sizes
     meta_model_var = tk.StringVar(value=cfg.get("meta_model", ""))
     subagent_model_var = tk.StringVar(value=cfg.get("subagent_model", ""))
     embed_model_var = tk.StringVar(value=cfg.get("embed_model", ""))
+    meta_ctx_var = tk.StringVar(value=str(cfg.get("meta_context_tokens", 4096)))
+    subagent_ctx_var = tk.StringVar(value=str(cfg.get("subagent_context_tokens", 4096)))
+    embed_ctx_var = tk.StringVar(value=str(cfg.get("embed_context_tokens", 2048)))
 
     ttk.Label(tab_backend, text="Meta Model:").grid(
         row=5, column=0, sticky="w", pady=4
@@ -140,6 +144,10 @@ def show(cfg: dict) -> dict | None:
         tab_backend, textvariable=meta_model_var, values=[], width=35
     )
     meta_combo.grid(row=5, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
+    ttk.Label(tab_backend, text="ctx:").grid(row=5, column=3, sticky="e", padx=(4, 2))
+    ttk.Entry(tab_backend, textvariable=meta_ctx_var, width=8).grid(
+        row=5, column=4, sticky="w", pady=4
+    )
 
     ttk.Label(tab_backend, text="Subagent Model:").grid(
         row=6, column=0, sticky="w", pady=4
@@ -148,6 +156,10 @@ def show(cfg: dict) -> dict | None:
         tab_backend, textvariable=subagent_model_var, values=[], width=35
     )
     subagent_combo.grid(row=6, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
+    ttk.Label(tab_backend, text="ctx:").grid(row=6, column=3, sticky="e", padx=(4, 2))
+    ttk.Entry(tab_backend, textvariable=subagent_ctx_var, width=8).grid(
+        row=6, column=4, sticky="w", pady=4
+    )
 
     ttk.Separator(tab_backend, orient="horizontal").grid(
         row=7, column=0, columnspan=3, sticky="ew", pady=4
@@ -162,6 +174,10 @@ def show(cfg: dict) -> dict | None:
             tab_backend, textvariable=embed_model_var, values=[], width=35
         )
         embed_combo.grid(row=8, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
+        ttk.Label(tab_backend, text="ctx:").grid(row=8, column=3, sticky="e", padx=(4, 2))
+        ttk.Entry(tab_backend, textvariable=embed_ctx_var, width=8).grid(
+            row=8, column=4, sticky="w", pady=4
+        )
         ttk.Label(
             tab_backend,
             text="(embedding model - used for vector recall with sqlite_vec)",
@@ -368,6 +384,19 @@ def show(cfg: dict) -> dict | None:
         foreground="gray",
     ).pack(anchor="w", pady=(0, 8))
 
+    # Workspace filter row
+    _ws_filter_frame = ttk.Frame(tab_sessions)
+    _ws_filter_frame.pack(fill="x", pady=(0, 6))
+    ttk.Label(_ws_filter_frame, text="Filter by workspace:").pack(side="left", padx=(0, 6))
+    _ws_filter_var = tk.StringVar(value="All workspaces")
+    _ws_filter_combo = ttk.Combobox(
+        _ws_filter_frame,
+        textvariable=_ws_filter_var,
+        state="readonly",
+        width=44,
+    )
+    _ws_filter_combo.pack(side="left")
+
     sessions_outer = ttk.Frame(tab_sessions)
     sessions_outer.pack(fill="both", expand=True)
 
@@ -396,8 +425,59 @@ def show(cfg: dict) -> dict | None:
 
     _session_vars: dict[str, tk.BooleanVar] = {}
     _sessions_ever_opened = [False]
+    # Full discovered session data: (sid, display_label, mtime, workspace_name)
+    _all_sessions_data: list[list[tuple[str, str, float, str]]] = [[]]
 
     _ADAPTER_DISPLAY: dict[str, str] = {"continue": "Continue", "ghcp": "GHCP"}
+
+    _ws_name_cache: dict[str, str] = {}
+
+    def _ws_name_from_hash(ws_hash: str | None) -> str:
+        """Resolve a workspaceStorage hash to a human-readable workspace name."""
+        from urllib.parse import unquote
+        import os as _os
+        if not ws_hash:
+            return "Unknown"
+        if ws_hash in _ws_name_cache:
+            return _ws_name_cache[ws_hash]
+        appdata = _os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        ws_file = Path(appdata) / "Code" / "User" / "workspaceStorage" / ws_hash / "workspace.json"
+        try:
+            data = json.loads(ws_file.read_text(encoding="utf-8"))
+            raw = data.get("workspace") or data.get("folder") or ""
+            decoded = unquote(raw).replace("file:///", "").replace("/", "\\")
+            name = Path(decoded).stem or ws_hash[:8]
+        except Exception:
+            name = ws_hash[:8]
+        _ws_name_cache[ws_hash] = name
+        return name
+
+    def _render_filtered_sessions(already_whitelisted: set[str], prev_checked: set[str]) -> None:
+        """Re-render the checkbox list applying the current workspace filter."""
+        for widget in sessions_inner.winfo_children():
+            widget.destroy()
+        current_filter = _ws_filter_var.get()
+        data = _all_sessions_data[0]
+        if current_filter != "All workspaces":
+            data = [row for row in data if row[3] == current_filter]
+        if not data:
+            sessions_status.config(text="No sessions match the current filter.")
+            return
+        sessions_status.config(
+            text=f"{len(data)} of {len(_all_sessions_data[0])} sessions shown - check any to watch."
+            if current_filter != "All workspaces"
+            else f"{len(data)} sessions found - check any to watch."
+        )
+        for sid, label, _mtime, _ws in data:
+            bvar = _session_vars.get(sid)
+            if bvar is None:
+                bvar = tk.BooleanVar(
+                    value=(sid in already_whitelisted or sid in prev_checked)
+                )
+                _session_vars[sid] = bvar
+            ttk.Checkbutton(
+                sessions_inner, variable=bvar, text=label
+            ).pack(anchor="w", pady=1)
 
     def _reload_sessions() -> None:
         # Preserve checked state across reloads (user-toggled + DB whitelist).
@@ -411,7 +491,7 @@ def show(cfg: dict) -> dict | None:
             from registry import discover_frontend_adapters
 
             discovered = discover_frontend_adapters()
-            all_sessions: list[tuple[str, str, float]] = []  # (sid, display_label, mtime)
+            all_sessions: list[tuple[str, str, float, str]] = []  # (sid, label, mtime, ws_name)
             seen_sids: set[str] = set()
             for adapter_name, adapter_cls in discovered.items():
                 # Only include adapters that are currently enabled in the Frontend tab.
@@ -435,11 +515,19 @@ def show(cfg: dict) -> dict | None:
                             mtime = adapter_inst.get_mtime(sid)
                         except Exception:
                             pass
+                        ws_name = "Unknown"
+                        try:
+                            if hasattr(adapter_inst, "get_session_workspace"):
+                                ws_name = _ws_name_from_hash(
+                                    adapter_inst.get_session_workspace(sid)
+                                )
+                        except Exception:
+                            pass
                         if title:
-                            label = f"{title}  ({sid[:8]})  [{host_label}]"
+                            label = f"{title}  ({sid[:8]})  [{host_label} | {ws_name}]"
                         else:
-                            label = f"{sid}  [{host_label}]"
-                        all_sessions.append((sid, label, mtime))
+                            label = f"{sid}  [{host_label} | {ws_name}]"
+                        all_sessions.append((sid, label, mtime, ws_name))
                 except Exception:
                     pass
 
@@ -450,24 +538,36 @@ def show(cfg: dict) -> dict | None:
                 already_whitelisted = set()
 
             all_sorted = sorted(all_sessions, key=lambda x: x[2], reverse=True)
+            _all_sessions_data[0] = all_sorted
+
             if not all_sorted:
                 sessions_status.config(text="No sessions found.")
+                _ws_filter_combo.configure(values=["All workspaces"])
+                _ws_filter_var.set("All workspaces")
                 return
 
-            sessions_status.config(
-                text=f"{len(all_sorted)} sessions found - check any to watch."
-            )
-            for sid, label, _mtime in all_sorted:
-                bvar = tk.BooleanVar(
-                    value=(sid in already_whitelisted or sid in prev_checked)
-                )
-                _session_vars[sid] = bvar
-                ttk.Checkbutton(
-                    sessions_inner, variable=bvar, text=label
-                ).pack(anchor="w", pady=1)
+            # Populate workspace filter combobox.
+            ws_names = sorted({row[3] for row in all_sorted})
+            _ws_filter_combo.configure(values=["All workspaces"] + ws_names)
+            if _ws_filter_var.get() not in ["All workspaces"] + ws_names:
+                _ws_filter_var.set("All workspaces")
+
+            _render_filtered_sessions(already_whitelisted, prev_checked)
 
         except Exception as exc:
             sessions_status.config(text=f"Error loading sessions: {exc}")
+
+    def _on_ws_filter_changed(*_args) -> None:
+        if not _all_sessions_data[0]:
+            return
+        try:
+            already_whitelisted = _db.load_session_whitelist()
+        except Exception:
+            already_whitelisted = set()
+        prev_checked = {sid for sid, bvar in _session_vars.items() if bvar.get()}
+        _render_filtered_sessions(already_whitelisted, prev_checked)
+
+    _ws_filter_var.trace_add("write", _on_ws_filter_changed)
 
     def _on_adapter_toggle(*_args) -> None:
         # Only reload the session list if the Sessions tab has been opened at
@@ -534,6 +634,22 @@ def show(cfg: dict) -> dict | None:
         new_cfg["meta_model"] = meta_model_var.get().strip()
         new_cfg["subagent_model"] = subagent_model_var.get().strip()
         new_cfg["embed_model"] = embed_model_var.get().strip()
+
+        for key, var, label in [
+            ("meta_context_tokens",     meta_ctx_var,     "Meta context tokens"),
+            ("subagent_context_tokens", subagent_ctx_var, "Subagent context tokens"),
+            ("embed_context_tokens",    embed_ctx_var,    "Embed context tokens"),
+        ]:
+            raw = var.get().strip()
+            if raw:
+                try:
+                    val = int(raw)
+                    if val < 256:
+                        raise ValueError("too small")
+                    new_cfg[key] = val
+                except ValueError:
+                    validation_label.config(text=f"{label} must be an integer >= 256.")
+                    return None
 
         backends = dict(cfg.get("backends", {}))
         bcfg_entry = dict(backends.get(adapter_name, {}))
